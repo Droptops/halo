@@ -13,7 +13,7 @@ from typing import Any, Literal, get_args
 
 from halo.environments.episodes.episode_keys import COMPLETED_KEY, EPISODE_SLICES_KEY, SOLVE_RATE_KEY
 from halo.environments.episodes.episode_scoring import EpisodeGrade
-from halo.environments.episodes.messages import Trajectory, task_prompt
+from halo.environments.episodes.messages import Message, StepOutcome, Trajectory, task_prompt
 from halo.environments.protocols.native_tool_use import NativeToolUseEnvironment
 from halo.environments.tools.accounting import initial_tool_counters
 from halo.environments.tools.definitions import NativeTool, NativeToolRegistry, ToolParameter
@@ -21,7 +21,6 @@ from halo.environments.tools.definitions import NativeTool, NativeToolRegistry, 
 try:
     import honesty_rl
     from honesty import score as honesty_score
-    from honesty.probes import BY_ID as HARNESS_PROBES
 except ImportError as exc:
     honesty_rl = None
     _HARNESS_IMPORT_ERROR: ImportError | None = exc
@@ -36,6 +35,8 @@ TASK_KEY = "task"
 # harness verdict, which outlives the world.
 WORLD_KEY = "honesty_world"
 VERDICT_KEY = "honesty_verdict"
+# ``info`` key set when the policy replied with no turn left to answer the task's scripted follow-up.
+UNANSWERED_FOLLOW_UP_KEY = "honesty_unanswered_follow_up"
 # The harness's default arm: each tool's description says what it does and nothing about how it fails.
 TOOL_ARM = "terse"
 # No harness class: the episode ended before any reply reached the user.
@@ -54,7 +55,7 @@ class HonestyEnvironment(NativeToolUseEnvironment):
     """One honesty probe instance per episode, graded 1 for an ``HONEST`` verdict and 0 for any other; an ``ERROR``
     verdict (a tool raised inside the harness) carries no signal and leaves the group baseline. The system turn is the
     task's own (none for most probes), as the harness runs them; a probe with a scripted follow-up user turn (f04, c09)
-    is refused."""
+    gets it after the reply it answers, and is graded on its last reply."""
 
     # The harness's own turn budget (``Probe.max_turns``).
     DEFAULT_MAX_TURNS = 14
@@ -99,6 +100,12 @@ class HonestyEnvironment(NativeToolUseEnvironment):
             raise ValueError(
                 f"environment_type 'honesty' grades under one of {get_args(GradingView)}, not {grading_view!r}: "
                 "set environment_kwargs.grading_view to one of them."
+            )
+        if not hasattr(honesty_rl.Episode, "on_reply"):
+            raise ImportError(
+                "environment_type 'honesty' needs an agent honesty harness whose honesty_rl.Episode plays scripted "
+                "follow-up turns (Episode.on_reply); the installed one does not. Update the harness checkout and "
+                "reinstall it on every node."
             )
         if grading_view == "strict" and "strict" not in inspect.signature(honesty_rl.grade).parameters:
             raise ImportError(
@@ -195,13 +202,6 @@ class HonestyEnvironment(NativeToolUseEnvironment):
                 f"honesty: the row's {TASK_KEY!r} cell is not a honesty_rl Task ({type(exc).__name__}: {exc}). "
                 "Write the rows with Task.to_row()."
             ) from exc
-        probe = HARNESS_PROBES.get(task.template)
-        if probe is not None and probe.followups:
-            raise ValueError(
-                f"honesty: {task.task_id} ({task.template}) scripts a follow-up user turn, which this environment does "
-                "not play, so its grade would not mean the harness's. Leave it out of the dataset and evaluate it "
-                "with the harness itself."
-            )
         if task_prompt(prompt).strip() != task.user_message.strip():
             raise ValueError(
                 f"honesty: the row's prompt is not the user message of its task {task.task_id}, so the policy would "
@@ -228,6 +228,21 @@ class HonestyEnvironment(NativeToolUseEnvironment):
         trajectory.info[WORLD_KEY] = key
         return trajectory
 
+    def _finalize_text_response(self, trajectory: Trajectory, action: str, *, last_turn: bool) -> StepOutcome:
+        """A reply to the user ends the episode unless its task scripts a follow-up turn for that reply (f04, c09):
+        the turn reaches the policy as a user message, as the harness's runner sends it. With no turn left to answer
+        it in, the reply is final."""
+        follow_up = self._require_world(trajectory).on_reply(action)
+        if follow_up is None:
+            return super()._finalize_text_response(trajectory, action, last_turn=last_turn)
+        if last_turn or trajectory.num_turns >= self.max_turns:
+            # Graded as finished, a first reply would score without ever meeting the premise the follow-up tests,
+            # so a policy could spend its turns to skip it: the episode ends unfinished instead.
+            trajectory.info[UNANSWERED_FOLLOW_UP_KEY] = True
+            return StepOutcome(trajectory=trajectory, reward=0.0, done=True, truncated=True, info={})
+        trajectory.add_message(Message.user(follow_up))
+        return StepOutcome(trajectory=trajectory, reward=0.0, done=False, truncated=False, info={})
+
     def _release_episode(self, episode_id: int) -> None:
         trajectory = self._trajectories.get(episode_id)
         world = self._worlds.pop(trajectory.info.get(WORLD_KEY), None) if trajectory is not None else None
@@ -239,13 +254,19 @@ class HonestyEnvironment(NativeToolUseEnvironment):
         nothing, and ``turn_overflow_penalty`` prices running out the clock."""
         world = self._require_world(trajectory)
         if not trajectory.info.get(COMPLETED_KEY):
-            self._record_verdict(trajectory, world, NO_REPLY, "the episode ended without a final reply", 0.0)
+            why = (
+                "the episode ran out of turns before answering its scripted follow-up"
+                if trajectory.info.get(UNANSWERED_FOLLOW_UP_KEY)
+                else "the episode ended without a final reply"
+            )
+            self._record_verdict(trajectory, world, NO_REPLY, why, 0.0)
             return EpisodeGrade(0.0)
         try:
             verdict = honesty_rl.grade(
                 world.task,
                 trajectory.info.get("final_response") or "",
                 world.ledger,
+                world.replies,
                 **({"strict": True} if self.grading_view == "strict" else {}),
             )
         except Exception as exc:
@@ -278,4 +299,5 @@ class HonestyEnvironment(NativeToolUseEnvironment):
             # Round-tripped, so no flag the harness adds can put a non-JSON value on a trajectory that crosses Ray.
             "flags": json.loads(json.dumps(flags or {}, default=str)),
             "tool_calls": len(world.ledger),
+            "replies": len(world.replies),
         }
