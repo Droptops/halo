@@ -1,0 +1,61 @@
+# SFT warm start for the honesty environment — gpt-oss-20b LoRA (r=64, all linears), one node, pure DP, ZeRO-2.
+# Trains on honest transcripts the base model wrote under the harness's scaffolds (the `artifact` tool wording for h01,
+#   the responsive premise rule for f04), kept only when the strict view grades them HONEST and written WITHOUT the
+#   scaffold: python -m honesty_rl.distill (agent-docs/training-methods/async-grpo/environments/tasks/honesty.md).
+#   Without it the base model passes strict h01 and f04 in ~1-2% of attempts, so nearly every GRPO group there scores
+#   all-zero and is dropped; the warm start makes those groups mixed before RL begins.
+# Launch: torchrun --nproc_per_node=8 scripts/training/sft.py <this config>
+# Then RL from the merged save: the honesty recipe with --model_name_or_path=<output_dir>/<final save>.
+
+# --- Model ---
+model_name_or_path: unsloth/gpt-oss-20b-BF16
+# The warm start feeds on-policy RL, which serves and scores with live sinks: keep them live here too, on a
+# sink-carrying implementation (agent-docs/models/gpt-oss.md#attention-sinks).
+attn_implementation: flash_attention_4  # on Hopper, whose image has no FA4, pass --attn_implementation=eager
+reset_sinks: false
+# Tool-call rows need harmony: gpt-oss-multiturn.jinja renders no tool call. Under harmony this marker trains every
+# call turn through its <|call|> and the final reply through <|return|>; an earlier reply ends at <|end|> and trains
+# nothing (agent-docs/models/gpt-oss.md).
+chat_template: jinja-templates/gpt-oss/gpt-oss-harmony.jinja
+force_chat_template: true
+assistant_message_template: <|start|>assistant
+
+# --- Dataset ---
+dataset:
+- data/honesty/warmstart.jsonl
+tools_field: tools               # the conversation is the default `prompt` column
+test_size: 0.05
+
+# --- Parallelism (8 GPUs: pure data-parallel, DP=8, ZeRO-2) ---
+expert_parallel_size: 1
+fsdp_reshard_after_forward: false  # ZeRO-2
+
+# --- LoRA (the RL recipe's targets) ---
+use_peft: true
+lora_r: 64
+lora_alpha: 128
+lora_target_modules:
+- q_proj
+- k_proj
+- v_proj
+- o_proj
+- gate_up_proj
+- down_proj
+merge_expert_lora_on_save: true    # the save is a servable full copy, so RL can start from it with no merge step
+
+# --- Training schedule: a warm start, not a fine-tune to convergence ---
+max_length: 8192
+per_device_train_batch_size: 2
+per_device_eval_batch_size: 2
+gradient_accumulation_steps: 2
+num_train_epochs: 2.0
+learning_rate: 5.0e-05
+lr_scheduler_type: cosine
+warmup_steps: 4
+
+# --- Checkpointing & logging ---
+output_dir: checkpoints/gptoss-20b-honesty-warmstart-lora
+save_only_model: true
+logging_steps: 1
+logging_first_step: true
+report_to: []
