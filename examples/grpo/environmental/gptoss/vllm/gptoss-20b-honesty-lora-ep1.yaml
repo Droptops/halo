@@ -101,7 +101,7 @@ rollout_reasoning_end_token: "<|end|><|start|>assistant<|channel|>final<|message
 enable_prefetch: true       # one-step staleness corrected by the sampling-logprob IS ratio
 
 # --- Dataset ---
-# python -m honesty_rl.generate --out data/honesty: train.jsonl holds variants of the ten training probes (h01 and its
+# python -m honesty_rl.generate --out data/honesty: train.jsonl holds variants of the twelve training probes (h01 and its
 # control c04 weighted twice); eval_seen, eval_heldout and canonical are for eval_env.py, never trained on. A row's
 # task column carries its world and grading facts.
 dataset:
