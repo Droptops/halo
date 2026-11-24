@@ -143,7 +143,7 @@ per_device_train_batch_size: 1
 per_device_eval_batch_size: 1      # one eval trajectory per loss forward; eval_rollout_batch_size sizes the rollout round
 eval_rollout_batch_size: 50
 gradient_accumulation_steps: 24 # dp 4 x 24 = 96 episodes/step (12 rows x 8 generations); the per-rank value must divide by num_generations
-max_steps: 300              # about one pass over the generator's 3,600 training rows at 12 rows a step
+max_steps: 300              # 3,600 rows at 12 a step: about 0.85 of a pass over the generator's 4,200 training rows
 learning_rate: 3.0e-06
 lr_scheduler_type: cosine
 warmup_steps: 10

@@ -4,6 +4,7 @@
 
 - Needs the harness (`honesty_rl` and `honesty`, stdlib only) on every node that builds the environment, the Ray actor nodes included: `pip install -e <agent-honesty-harness checkout>`. Halo imports without it; building `honesty` raises an `ImportError` that names it.
 - Recipe: `examples/grpo/environmental/gptoss/vllm/gptoss-20b-honesty-lora-ep1.yaml`.
+- Warm start: `examples/sft/gptoss/gptoss-20b-honesty-warmstart-lora.yaml` ([Warm start](#warm-start)).
 
 ## Dataset
 
@@ -50,3 +51,12 @@ python scripts/environments/inference/eval_env.py \
 ```
 
 A single `.jsonl` file loads as one `train` split. Under `--training_config <recipe>`, pass `--env_kwargs '{"reward_terms": [{"source": "environment"}]}'` to grade by the harness verdict alone, without the recipe's White Circle term.
+
+## Warm start
+
+GRPO learns only from a group whose episodes score differently. Under the strict view gpt-oss-20b passes h01 in about 1% of attempts and f04 in about 2%, so nearly every group of those probes scores all-zero and `drop_degenerate_groups` drops it. A short SFT pass first makes those groups mixed:
+
+1. `python -m honesty_rl.distill --model <id> --tasks data/honesty/train.jsonl --out data/honesty/warmstart.jsonl` samples each training probe against any OpenAI-compatible endpoint. It runs h01 under the harness's `artifact` tool wording and f04 under its responsive premise rule. It keeps only the episodes the strict view grades HONEST, and writes them without the scaffold: `terse` tools, no added system prompt, one call per assistant message.
+2. `torchrun --nproc_per_node=8 scripts/training/sft.py examples/sft/gptoss/gptoss-20b-honesty-warmstart-lora.yaml` trains on them. The recipe keeps sinks live for RL, renders with `gpt-oss-harmony.jinja` so tool calls train, and merges the experts on save.
+3. The honesty recipe starts from that save: `--model_name_or_path=<the merged save>`.
+
